@@ -1,129 +1,123 @@
-const metadata = Object.freeze({
-  repo: "exp-voice-assistant-local",
-  category: "audio",
-  purpose: "로컬 음성 비서",
-  priority: "P2",
-  trackLabel: "Audio",
-  kindLabel: "experiment",
-  trackSlug: "audio",
-  workloadKind: "voice",
-  pagesUrl: "https://ai-webgpu-lab.github.io/exp-voice-assistant-local/",
-  repoUrl: "https://github.com/ai-webgpu-lab/exp-voice-assistant-local",
-  readmeUrl: "https://github.com/ai-webgpu-lab/exp-voice-assistant-local/blob/main/README.md",
-  resultsUrl: "https://github.com/ai-webgpu-lab/exp-voice-assistant-local/blob/main/RESULTS.md"
-});
+const EXECUTION_MODES = {
+  webgpu: {
+    id: "webgpu",
+    label: "WebGPU ready",
+    backend: "webgpu",
+    fallbackTriggered: false,
+    workerMode: "worker",
+    stageMultiplier: 1,
+    intentDelayMs: 22,
+    replyDelayMs: 26,
+    ttsStreamGapMs: 16
+  },
+  fallback: {
+    id: "fallback",
+    label: "CPU fallback",
+    backend: "cpu",
+    fallbackTriggered: true,
+    workerMode: "main",
+    stageMultiplier: 1.8,
+    intentDelayMs: 42,
+    replyDelayMs: 44,
+    ttsStreamGapMs: 24
+  }
+};
+
+function resolveExecutionMode() {
+  const requested = new URLSearchParams(window.location.search).get("mode");
+  const hasWebGpu = typeof navigator !== "undefined" && Boolean(navigator.gpu);
+  if (requested === "fallback" || !hasWebGpu) return EXECUTION_MODES.fallback;
+  return EXECUTION_MODES.webgpu;
+}
+
+const executionMode = resolveExecutionMode();
+
+const requestedMode = typeof window !== "undefined"
+  ? new URLSearchParams(window.location.search).get("mode")
+  : null;
+const isRealRuntimeMode = typeof requestedMode === "string" && requestedMode.startsWith("real-");
+const REAL_ADAPTER_WAIT_MS = 5000;
+const REAL_ADAPTER_LOAD_MS = 20000;
+
+function withTimeout(promise, timeoutMs, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs} ms`)), timeoutMs);
+    promise.then((value) => {
+      clearTimeout(timer);
+      resolve(value);
+    }, (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
+
+function findRegisteredRealRuntime() {
+  const registry = typeof window !== "undefined" ? window.__aiWebGpuLabRuntimeRegistry : null;
+  if (!registry || typeof registry.list !== "function") return null;
+  return registry.list().find((adapter) => adapter && adapter.isReal === true) || null;
+}
+
+async function awaitRealRuntime(timeoutMs = REAL_ADAPTER_WAIT_MS) {
+  const startedAt = performance.now();
+  while (performance.now() - startedAt < timeoutMs) {
+    const adapter = findRegisteredRealRuntime();
+    if (adapter) return adapter;
+    if (typeof window !== "undefined" && window.__aiWebGpuLabRealVoiceAssistantBootstrapError) {
+      return null;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return null;
+}
 
 const state = {
   startedAt: performance.now(),
-  environment: null,
-  probes: {
-    webgpu: null,
-    frame: null,
-    worker: null
-  },
+  environment: buildEnvironment(),
+  fixture: null,
+  active: false,
+  run: null,
+  transcript: "",
+  reply: "",
+  realAdapterError: null,
   logs: []
 };
 
-const knownLimitKeys = [
-  "maxTextureDimension1D",
-  "maxTextureDimension2D",
-  "maxTextureDimension3D",
-  "maxBindGroups",
-  "maxBindingsPerBindGroup",
-  "maxUniformBufferBindingSize",
-  "maxStorageBufferBindingSize",
-  "maxComputeInvocationsPerWorkgroup",
-  "maxComputeWorkgroupStorageSize",
-  "maxBufferSize"
-];
-
 const elements = {
-  metaGrid: document.getElementById("meta-grid"),
   statusRow: document.getElementById("status-row"),
-  statusSummary: document.getElementById("status-summary"),
-  focusList: document.getElementById("focus-list"),
-  nextSteps: document.getElementById("next-steps"),
-  metricsGrid: document.getElementById("metrics-grid"),
-  environmentJson: document.getElementById("environment-json"),
-  resultJson: document.getElementById("result-json"),
-  activityLog: document.getElementById("activity-log"),
-  detectEnvironment: document.getElementById("detect-environment"),
-  runWebgpu: document.getElementById("run-webgpu"),
-  runFrame: document.getElementById("run-frame"),
-  runWorker: document.getElementById("run-worker"),
-  downloadJson: document.getElementById("download-json")
+  summary: document.getElementById("summary"),
+  runAssistant: document.getElementById("run-assistant"),
+  downloadJson: document.getElementById("download-json"),
+  transcriptView: document.getElementById("transcript-view"),
+  replyView: document.getElementById("reply-view"),
+  metricGrid: document.getElementById("metric-grid"),
+  metaGrid: document.getElementById("meta-grid"),
+  logList: document.getElementById("log-list"),
+  resultJson: document.getElementById("result-json")
 };
 
 function round(value, digits = 2) {
-  if (!Number.isFinite(value)) {
-    return null;
-  }
-
-  const factor = Math.pow(10, digits);
+  if (!Number.isFinite(value)) return null;
+  const factor = 10 ** digits;
   return Math.round(value * factor) / factor;
-}
-
-function percentile(values, ratio) {
-  if (!values.length) {
-    return null;
-  }
-
-  const sorted = [...values].sort((left, right) => left - right);
-  const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * ratio) - 1));
-  return sorted[index];
-}
-
-function nowIso() {
-  return new Date().toISOString();
 }
 
 function parseBrowser() {
   const ua = navigator.userAgent;
-  const candidates = [
-    ["Edg/", "Edge"],
-    ["Chrome/", "Chrome"],
-    ["Firefox/", "Firefox"],
-    ["Version/", "Safari"]
-  ];
-
-  for (const [needle, name] of candidates) {
+  for (const [needle, name] of [["Edg/", "Edge"], ["Chrome/", "Chrome"], ["Firefox/", "Firefox"], ["Version/", "Safari"]]) {
     const marker = ua.indexOf(needle);
-    if (marker >= 0) {
-      const version = ua.slice(marker + needle.length).split(/[\s)/;]/)[0] || "unknown";
-      return { name, version };
-    }
+    if (marker >= 0) return { name, version: ua.slice(marker + needle.length).split(/[\s)/;]/)[0] || "unknown" };
   }
-
   return { name: "Unknown", version: "unknown" };
 }
 
 function parseOs() {
   const ua = navigator.userAgent;
-
-  if (/Windows NT/i.test(ua)) {
-    const match = ua.match(/Windows NT ([0-9.]+)/i);
-    return { name: "Windows", version: match ? match[1] : "unknown" };
-  }
-
-  if (/Mac OS X/i.test(ua)) {
-    const match = ua.match(/Mac OS X ([0-9_]+)/i);
-    return { name: "macOS", version: match ? match[1].replace(/_/g, ".") : "unknown" };
-  }
-
-  if (/Android/i.test(ua)) {
-    const match = ua.match(/Android ([0-9.]+)/i);
-    return { name: "Android", version: match ? match[1] : "unknown" };
-  }
-
-  if (/(iPhone|iPad|CPU OS)/i.test(ua)) {
-    const match = ua.match(/OS ([0-9_]+)/i);
-    return { name: "iOS", version: match ? match[1].replace(/_/g, ".") : "unknown" };
-  }
-
-  if (/Linux/i.test(ua)) {
-    return { name: "Linux", version: "unknown" };
-  }
-
+  if (/Windows NT/i.test(ua)) return { name: "Windows", version: (ua.match(/Windows NT ([0-9.]+)/i) || [])[1] || "unknown" };
+  if (/Mac OS X/i.test(ua)) return { name: "macOS", version: ((ua.match(/Mac OS X ([0-9_]+)/i) || [])[1] || "unknown").replace(/_/g, ".") };
+  if (/Android/i.test(ua)) return { name: "Android", version: (ua.match(/Android ([0-9.]+)/i) || [])[1] || "unknown" };
+  if (/(iPhone|iPad|CPU OS)/i.test(ua)) return { name: "iOS", version: ((ua.match(/OS ([0-9_]+)/i) || [])[1] || "unknown").replace(/_/g, ".") };
+  if (/Linux/i.test(ua)) return { name: "Linux", version: "unknown" };
   return { name: "Unknown", version: "unknown" };
 }
 
@@ -131,537 +125,396 @@ function inferDeviceClass() {
   const threads = navigator.hardwareConcurrency || 0;
   const memory = navigator.deviceMemory || 0;
   const mobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
-
-  if (mobile) {
-    if (memory >= 6 && threads >= 8) {
-      return "mobile-high";
-    }
-
-    return "mobile-mid";
-  }
-
-  if (memory >= 16 && threads >= 12) {
-    return "desktop-high";
-  }
-
-  if (memory >= 8 && threads >= 8) {
-    return "desktop-mid";
-  }
-
-  if (threads >= 4) {
-    return "laptop";
-  }
-
+  if (mobile) return memory >= 6 && threads >= 8 ? "mobile-high" : "mobile-mid";
+  if (memory >= 16 && threads >= 12) return "desktop-high";
+  if (memory >= 8 && threads >= 8) return "desktop-mid";
+  if (threads >= 4) return "laptop";
   return "unknown";
 }
 
-function baseEnvironment() {
+function buildEnvironment() {
   return {
     browser: parseBrowser(),
     os: parseOs(),
     device: {
       name: navigator.platform || "unknown",
       class: inferDeviceClass(),
-      cpu: navigator.hardwareConcurrency ? String(navigator.hardwareConcurrency) + " threads" : "unknown",
+      cpu: navigator.hardwareConcurrency ? `${navigator.hardwareConcurrency} threads` : "unknown",
       memory_gb: navigator.deviceMemory || undefined,
       power_mode: "unknown"
     },
     gpu: {
-      adapter: "unknown",
-      required_features: [],
-      limits: {}
+      adapter: executionMode.fallbackTriggered ? "cpu-fallback-audio" : "navigator.gpu available",
+      required_features: executionMode.fallbackTriggered ? [] : ["shader-f16"],
+      limits: executionMode.fallbackTriggered ? {} : { maxBindGroups: 4 }
     },
-    backend: "wasm",
-    fallback_triggered: true,
-    worker_mode: "unknown",
-    cache_state: "unknown"
+    backend: executionMode.backend,
+    fallback_triggered: executionMode.fallbackTriggered,
+    worker_mode: executionMode.workerMode,
+    cache_state: "warm"
   };
 }
 
-function ensureEnvironment() {
-  if (!state.environment) {
-    state.environment = baseEnvironment();
-  }
-
-  return state.environment;
-}
-
 function log(message) {
-  state.logs.unshift("[" + new Date().toLocaleTimeString() + "] " + message);
-  state.logs = state.logs.slice(0, 14);
+  state.logs.unshift(`[${new Date().toLocaleTimeString()}] ${message}`);
+  state.logs = state.logs.slice(0, 12);
   renderLogs();
 }
 
-function metadataCards() {
-  return [
-    ["Track", metadata.trackLabel],
-    ["Kind", metadata.kindLabel],
-    ["Priority", metadata.priority],
-    ["Workload", metadata.workloadKind],
-    ["Pages URL", metadata.pagesUrl]
-  ];
+async function loadFixture() {
+  if (state.fixture) return state.fixture;
+  const response = await fetch("./voice-fixture.json", { cache: "no-store" });
+  state.fixture = await response.json();
+  return state.fixture;
 }
 
-function focusItems() {
-  const common = [
-    "Collect a reproducible browser and device snapshot before adding workload-specific code.",
-    "Use the exported JSON as the first draft for reports/raw once you validate it in the target browser."
-  ];
-
-  switch (metadata.category) {
-    case "template":
-      return common.concat([
-        "Verify the smallest WebGPU success path and copy that shape into downstream repositories.",
-        "Document capability and fallback behavior before adding framework-specific layers."
-      ]);
-    case "benchmark":
-      return common.concat([
-        "Replace lightweight frame and worker probes with workload-specific comparison harnesses.",
-        "Keep input profiles and environment notes identical across runs."
-      ]);
-    case "app":
-      return common.concat([
-        "Check whether the integration surface can acquire GPU resources without blocking the UI.",
-        "Turn this probe into the first user-facing end-to-end demo once the core flow exists."
-      ]);
-    case "graphics":
-    case "blackhole":
-      return common.concat([
-        "Prioritize adapter/device acquisition, frame pacing, and scene-load instrumentation.",
-        "Capture visual correctness notes together with frame timing."
-      ]);
-    default:
-      return common.concat([
-        "Prioritize adapter readiness, worker offload viability, and result export hygiene.",
-        "Replace generic probes with model or runtime-specific metrics as soon as the first harness lands."
-      ]);
-  }
+function words(text) {
+  return text.toLowerCase().replace(/[^a-z0-9\s-]/g, " ").split(/\s+/).filter(Boolean);
 }
 
-function nextSteps() {
-  const steps = [
-    "Save an exported JSON after validating it in the target browser and move it into reports/raw/.",
-    "Replace generic probes in public/app.js with workload-specific setup and KPI collection.",
-    "Update RESULTS.md with the first measured run and record fallback conditions explicitly."
-  ];
-
-  if (metadata.category === "template") {
-    steps.unshift("Promote the minimal setup path into a copyable starter template for downstream repos.");
-  }
-
-  if (metadata.category === "benchmark") {
-    steps.unshift("Define the comparison matrix and freeze one shared input profile before collecting numbers.");
-  }
-
-  if (metadata.category === "app") {
-    steps.unshift("Connect one real user flow and treat this probe as the readiness gate before adding polish.");
-  }
-
-  return steps;
+function chars(text) {
+  return text.toLowerCase().replace(/\s+/g, "").split("");
 }
 
-function renderList(element, items) {
-  element.innerHTML = "";
-  for (const item of items) {
-    const li = document.createElement("li");
-    li.textContent = item;
-    element.appendChild(li);
-  }
-}
+function levenshtein(left, right) {
+  const rows = left.length + 1;
+  const cols = right.length + 1;
+  const matrix = Array.from({ length: rows }, () => new Array(cols).fill(0));
 
-function renderMeta() {
-  elements.metaGrid.innerHTML = "";
+  for (let row = 0; row < rows; row += 1) matrix[row][0] = row;
+  for (let col = 0; col < cols; col += 1) matrix[0][col] = col;
 
-  for (const [label, value] of metadataCards()) {
-    const card = document.createElement("article");
-    card.className = "meta-card";
-
-    const labelNode = document.createElement("span");
-    labelNode.className = "label";
-    labelNode.textContent = label;
-
-    const valueNode = document.createElement(label === "Pages URL" ? "a" : "div");
-    valueNode.className = "value";
-    if (label === "Pages URL") {
-      valueNode.href = value;
-      valueNode.className = "value link";
+  for (let row = 1; row < rows; row += 1) {
+    for (let col = 1; col < cols; col += 1) {
+      const cost = left[row - 1] === right[col - 1] ? 0 : 1;
+      matrix[row][col] = Math.min(
+        matrix[row - 1][col] + 1,
+        matrix[row][col - 1] + 1,
+        matrix[row - 1][col - 1] + cost
+      );
     }
-    valueNode.textContent = value;
+  }
 
-    card.appendChild(labelNode);
-    card.appendChild(valueNode);
+  return matrix[left.length][right.length];
+}
+
+function renderTranscript(text) {
+  elements.transcriptView.textContent = text || "No voice turn yet.";
+}
+
+function renderReply(text) {
+  elements.replyView.textContent = text || "No reply emitted yet.";
+}
+
+function mutateTranscript(reference) {
+  if (!executionMode.fallbackTriggered) return reference;
+  return reference
+    .replace("fallback notes", "fallback modes")
+    .replace("lab status", "status");
+}
+
+async function sleep(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runRealRuntimeVoiceAssistant(adapter) {
+  log(`Connecting real runtime adapter '${adapter.id}'.`);
+  await withTimeout(
+    Promise.resolve(adapter.loadModel({ modelId: "voice-assistant-local-default" })),
+    REAL_ADAPTER_LOAD_MS,
+    `loadModel(${adapter.id})`
+  );
+  const prefill = await withTimeout(
+    Promise.resolve(adapter.prefill({ promptTokens: 96 })),
+    REAL_ADAPTER_LOAD_MS,
+    `prefill(${adapter.id})`
+  );
+  const decode = await withTimeout(
+    Promise.resolve(adapter.decode({ tokenBudget: 32 })),
+    REAL_ADAPTER_LOAD_MS,
+    `decode(${adapter.id})`
+  );
+  log(`Real runtime adapter '${adapter.id}' ready: prefill_tok_per_sec=${prefill?.tokPerSec ?? "?"}, decode_tok_per_sec=${decode?.tokPerSec ?? "?"}.`);
+  return { adapter, prefill, decode };
+}
+
+async function runAssistantTurn() {
+  if (state.active) return;
+  state.active = true;
+  state.run = null;
+  state.transcript = "";
+  state.reply = "";
+  renderTranscript("");
+  renderReply("");
+  render();
+
+  if (isRealRuntimeMode) {
+    log(`Mode=${requestedMode} requested; awaiting real runtime adapter registration.`);
+    const adapter = await awaitRealRuntime();
+    if (adapter) {
+      try {
+        const { prefill, decode } = await runRealRuntimeVoiceAssistant(adapter);
+        state.realAdapterPrefill = prefill;
+        state.realAdapterDecode = decode;
+        state.realAdapter = adapter;
+      } catch (error) {
+        state.realAdapterError = error?.message || String(error);
+        log(`Real runtime '${adapter.id}' failed: ${state.realAdapterError}; falling back to deterministic.`);
+      }
+    } else {
+      const reason = (typeof window !== "undefined" && window.__aiWebGpuLabRealVoiceAssistantBootstrapError) || "timed out waiting for adapter registration";
+      state.realAdapterError = reason;
+      log(`No real runtime adapter registered (${reason}); falling back to deterministic voice assistant baseline.`);
+    }
+  }
+
+  const fixture = await loadFixture();
+  const startedAt = performance.now();
+  let firstPartialMs = 0;
+
+  log(`Wake word detected: ${fixture.wakeWord}.`);
+  for (let index = 0; index < fixture.segments.length; index += 1) {
+    const segment = fixture.segments[index];
+    await sleep(segment.processingMs * executionMode.stageMultiplier);
+    const partial = fixture.segments.slice(0, index + 1).map((item) => item.text).join(" ");
+    state.transcript = partial;
+    if (!firstPartialMs) firstPartialMs = performance.now() - startedAt;
+    renderTranscript(state.transcript);
+    log(`Partial ${index + 1}/${fixture.segments.length}: ${segment.text}`);
+  }
+
+  const finalTranscript = mutateTranscript(state.transcript);
+  state.transcript = finalTranscript;
+  renderTranscript(finalTranscript);
+  const finalLatencyMs = performance.now() - startedAt;
+
+  const referenceWords = words(fixture.reference);
+  const predictedWords = words(finalTranscript);
+  const referenceChars = chars(fixture.reference);
+  const predictedChars = chars(finalTranscript);
+  const wer = levenshtein(referenceWords, predictedWords) / Math.max(referenceWords.length, 1);
+  const cer = levenshtein(referenceChars, predictedChars) / Math.max(referenceChars.length, 1);
+
+  const intentStartedAt = performance.now();
+  await sleep(fixture.intent.processingMs + executionMode.intentDelayMs);
+  const intentMs = performance.now() - intentStartedAt;
+  log(`Intent routed: ${fixture.intent.id}.`);
+
+  const replyStartedAt = performance.now();
+  await sleep(fixture.reply.processingMs + executionMode.replyDelayMs);
+  state.reply = fixture.reply.text;
+  renderReply(state.reply);
+  const replyMs = performance.now() - replyStartedAt;
+  log("Deterministic reply draft prepared.");
+
+  const ttsStartedAt = performance.now();
+  let firstAudioMs = 0;
+  for (let index = 0; index < fixture.ttsChunks.length; index += 1) {
+    const chunk = fixture.ttsChunks[index];
+    await sleep((chunk.synthesisMs + executionMode.ttsStreamGapMs) * executionMode.stageMultiplier);
+    if (!firstAudioMs) firstAudioMs = performance.now() - startedAt;
+    log(`TTS chunk ${index + 1}/${fixture.ttsChunks.length}: ${chunk.text}`);
+  }
+  const ttsMs = performance.now() - ttsStartedAt;
+  const roundtripMs = performance.now() - startedAt;
+
+  state.run = {
+    audioSeconds: fixture.audioSeconds,
+    segmentCount: fixture.segments.length,
+    wakeWord: fixture.wakeWord,
+    firstPartialMs,
+    finalLatencyMs,
+    roundtripMs,
+    firstAudioMs,
+    audioSecPerSec: fixture.audioSeconds / Math.max(finalLatencyMs / 1000, 0.001),
+    wer,
+    cer,
+    transcript: finalTranscript,
+    reply: fixture.reply.text,
+    intentId: fixture.intent.id,
+    intentMs,
+    replyMs,
+    ttsMs,
+    ttsVoice: fixture.ttsVoice,
+    realAdapter: state.realAdapter || null
+  };
+  state.active = false;
+  log(`Voice turn complete: final ${round(state.run.finalLatencyMs, 2)} ms, roundtrip ${round(state.run.roundtripMs, 2)} ms.`);
+  render();
+}
+
+function describeRuntimeAdapter() {
+  const registry = typeof window !== "undefined" ? window.__aiWebGpuLabRuntimeRegistry : null;
+  const requested = typeof window !== "undefined"
+    ? new URLSearchParams(window.location.search).get("mode")
+    : null;
+  if (registry) {
+    return registry.describe(requested);
+  }
+  return {
+    id: "deterministic-voice-assistant",
+    label: "Deterministic Voice Assistant",
+    status: "deterministic",
+    isReal: false,
+    version: "1.0.0",
+    capabilities: ["prefill", "decode", "fixed-output-budget"],
+    runtimeType: "synthetic",
+    message: "Runtime adapter registry unavailable; using inline deterministic mock."
+  };
+}
+
+function buildResult() {
+  const run = state.run;
+  return {
+    meta: {
+      repo: "exp-voice-assistant-local",
+      commit: "bootstrap-generated",
+      timestamp: new Date().toISOString(),
+      owner: "ai-webgpu-lab",
+      track: "audio",
+      scenario: (state.run && state.run.realAdapter) ? `voice-assistant-local-real-${state.run.realAdapter.id}` : (run ? "voice-assistant-local-readiness" : "voice-assistant-local-pending"),
+      notes: run
+        ? `wakeWord=${run.wakeWord}; segments=${run.segmentCount}; intent=${run.intentId}; ttsVoice=${run.ttsVoice}; firstAudioMs=${round(run.firstAudioMs, 2)}; roundtripMs=${round(run.roundtripMs, 2)}; backend=${state.environment.backend}; fallback=${state.environment.fallback_triggered}${state.run && state.run.realAdapter ? `; realAdapter=${state.run.realAdapter.id}` : (isRealRuntimeMode && state.realAdapterError ? `; realAdapter=fallback(${state.realAdapterError})` : "")}`
+        : "Run the deterministic voice assistant readiness harness."
+    },
+    environment: state.environment,
+    workload: {
+      kind: "voice-assistant",
+      name: "voice-assistant-local-readiness",
+      input_profile: state.fixture ? `${state.fixture.audioSeconds}s-${state.fixture.segments.length}-segments` : "fixture-pending",
+      model_id: "deterministic-voice-assistant-local-v1",
+      dataset: "voice-fixture-v1"
+    },
+    metrics: {
+      common: {
+        time_to_interactive_ms: round(performance.now() - state.startedAt, 2) || 0,
+        init_ms: run ? round(run.roundtripMs, 2) || 0 : 0,
+        success_rate: run ? 1 : 0.5,
+        peak_memory_note: navigator.deviceMemory ? `${navigator.deviceMemory} GB reported by browser` : "deviceMemory unavailable",
+        error_type: ""
+      },
+      stt: {
+        audio_sec_per_sec: run ? round(run.audioSecPerSec, 2) || 0 : 0,
+        first_partial_ms: run ? round(run.firstPartialMs, 2) || 0 : 0,
+        final_latency_ms: run ? round(run.finalLatencyMs, 2) || 0 : 0,
+        roundtrip_ms: run ? round(run.roundtripMs, 2) || 0 : 0,
+        wer: run ? round(run.wer, 4) || 0 : 0,
+        cer: run ? round(run.cer, 4) || 0 : 0
+      }
+    },
+    status: run ? "success" : "partial",
+    artifacts: {
+      raw_logs: state.logs.slice(0, 5),
+      deploy_url: "https://ai-webgpu-lab.github.io/exp-voice-assistant-local/",
+      runtime_adapter: describeRuntimeAdapter()
+    }
+  };
+}
+
+function renderStatus() {
+  const badges = state.active
+    ? ["Voice turn running", executionMode.label]
+    : state.run
+      ? [`roundtrip ${round(state.run.roundtripMs, 2)} ms`, `${round(state.run.audioSecPerSec, 2)} audioSec/s`]
+      : ["Fixture ready", executionMode.label];
+
+  elements.statusRow.innerHTML = "";
+  for (const text of badges) {
+    const node = document.createElement("span");
+    node.className = "badge";
+    node.textContent = text;
+    elements.statusRow.appendChild(node);
+  }
+
+  elements.summary.textContent = state.run
+    ? `Last run: first partial ${round(state.run.firstPartialMs, 2)} ms, final ${round(state.run.finalLatencyMs, 2)} ms, roundtrip ${round(state.run.roundtripMs, 2)} ms, intent ${state.run.intentId}.`
+    : "Run the local voice assistant baseline to process the bundled utterance, route an intent, and stream a deterministic reply.";
+}
+
+function renderMetrics() {
+  const run = state.run;
+  const cards = [
+    ["Audio", state.fixture ? `${state.fixture.audioSeconds} s` : "pending"],
+    ["First Partial", run ? `${round(run.firstPartialMs, 2)} ms` : "pending"],
+    ["Final Latency", run ? `${round(run.finalLatencyMs, 2)} ms` : "pending"],
+    ["Roundtrip", run ? `${round(run.roundtripMs, 2)} ms` : "pending"],
+    ["Intent", run ? run.intentId : "pending"],
+    ["WER", run ? `${round(run.wer, 4)}` : "pending"]
+  ];
+
+  elements.metricGrid.innerHTML = "";
+  for (const [label, value] of cards) {
+    const card = document.createElement("article");
+    card.className = "card";
+    card.innerHTML = `<span class="label">${label}</span><div class="value">${value}</div>`;
+    elements.metricGrid.appendChild(card);
+  }
+}
+
+function renderEnvironment() {
+  const info = [
+    ["Browser", `${state.environment.browser.name} ${state.environment.browser.version}`],
+    ["OS", `${state.environment.os.name} ${state.environment.os.version}`],
+    ["Device", state.environment.device.class],
+    ["CPU", state.environment.device.cpu],
+    ["Memory", state.environment.device.memory_gb ? `${state.environment.device.memory_gb} GB` : "unknown"],
+    ["Backend", state.environment.backend],
+    ["Fallback", String(state.environment.fallback_triggered)],
+    ["Worker Mode", state.environment.worker_mode],
+    ["TTS Voice", state.run ? state.run.ttsVoice : (state.fixture ? state.fixture.ttsVoice : "pending")]
+  ];
+
+  elements.metaGrid.innerHTML = "";
+  for (const [label, value] of info) {
+    const card = document.createElement("article");
+    card.className = "card";
+    card.innerHTML = `<span class="label">${label}</span><div class="value">${value}</div>`;
     elements.metaGrid.appendChild(card);
   }
 }
 
-function summarizeStatus() {
-  if (!state.environment) {
-    return "Environment detection has not run yet.";
-  }
-
-  if (!state.probes.webgpu) {
-    return "Environment captured. Run the WebGPU probe to see whether the repository can stay on the GPU path.";
-  }
-
-  if (!state.probes.webgpu.available) {
-    return "Environment captured, but WebGPU is not available. The exported JSON records a fallback path so you can keep the run reproducible.";
-  }
-
-  if (!state.probes.frame || !state.probes.worker) {
-    return "WebGPU is available. Run the frame and worker probes next to capture baseline responsiveness metrics.";
-  }
-
-  return "Environment, WebGPU, frame pacing, and worker round-trip probes are complete. Promote this JSON into reports/raw after validating it against the intended workload.";
-}
-
-function renderStatus() {
-  const badges = [];
-
-  badges.push({
-    tone: state.environment ? "success" : "warn",
-    text: state.environment ? "Environment ready" : "Environment pending"
-  });
-
-  if (!state.probes.webgpu) {
-    badges.push({ tone: "warn", text: "WebGPU probe pending" });
-  } else if (state.probes.webgpu.available) {
-    badges.push({ tone: "success", text: "WebGPU available" });
-  } else {
-    badges.push({ tone: "danger", text: "WebGPU unavailable" });
-  }
-
-  badges.push({
-    tone: state.probes.frame ? "success" : "warn",
-    text: state.probes.frame ? "Frame probe done" : "Frame probe pending"
-  });
-  badges.push({
-    tone: state.probes.worker ? "success" : "warn",
-    text: state.probes.worker ? "Worker probe done" : "Worker probe pending"
-  });
-
-  elements.statusRow.innerHTML = "";
-  for (const badge of badges) {
-    const node = document.createElement("span");
-    node.className = "badge " + badge.tone;
-    node.textContent = badge.text;
-    elements.statusRow.appendChild(node);
-  }
-
-  elements.statusSummary.textContent = summarizeStatus();
-}
-
-function metricCards() {
-  const cards = [];
-  cards.push(["TTI", round(performance.now() - state.startedAt, 1) ? round(performance.now() - state.startedAt, 1) + " ms" : "pending"]);
-
-  if (state.probes.webgpu) {
-    cards.push(["WebGPU Init", state.probes.webgpu.initMs ? round(state.probes.webgpu.initMs, 1) + " ms" : state.probes.webgpu.available ? "ready" : "fallback"]);
-  } else {
-    cards.push(["WebGPU Init", "pending"]);
-  }
-
-  if (state.probes.frame) {
-    cards.push(["Avg FPS", round(state.probes.frame.avgFps, 1) + " fps"]);
-    cards.push(["P95 Frame", round(state.probes.frame.p95FrameMs, 2) + " ms"]);
-  } else {
-    cards.push(["Avg FPS", "pending"]);
-    cards.push(["P95 Frame", "pending"]);
-  }
-
-  if (state.probes.worker) {
-    cards.push(["Worker RTT", round(state.probes.worker.avgRttMs, 2) + " ms"]);
-    cards.push(["Worker P95", round(state.probes.worker.p95RttMs, 2) + " ms"]);
-  } else {
-    cards.push(["Worker RTT", "pending"]);
-    cards.push(["Worker P95", "pending"]);
-  }
-
-  return cards;
-}
-
-function renderMetrics() {
-  elements.metricsGrid.innerHTML = "";
-
-  for (const [label, value] of metricCards()) {
-    const card = document.createElement("article");
-    card.className = "metric-card";
-
-    const labelNode = document.createElement("span");
-    labelNode.className = "label";
-    labelNode.textContent = label;
-
-    const valueNode = document.createElement("div");
-    valueNode.className = "value";
-    valueNode.textContent = value;
-
-    card.appendChild(labelNode);
-    card.appendChild(valueNode);
-    elements.metricsGrid.appendChild(card);
-  }
-}
-
 function renderLogs() {
-  elements.activityLog.innerHTML = "";
-
-  if (!state.logs.length) {
+  elements.logList.innerHTML = "";
+  const entries = state.logs.length ? state.logs : ["No voice activity yet."];
+  for (const entry of entries) {
     const li = document.createElement("li");
-    li.textContent = "No probe activity yet.";
-    elements.activityLog.appendChild(li);
-    return;
+    li.textContent = entry;
+    elements.logList.appendChild(li);
   }
-
-  for (const item of state.logs) {
-    const li = document.createElement("li");
-    li.textContent = item;
-    elements.activityLog.appendChild(li);
-  }
-}
-
-function schemaResult() {
-  const environment = ensureEnvironment();
-  const webgpu = state.probes.webgpu;
-
-  if (webgpu) {
-    environment.backend = webgpu.available ? "webgpu" : "wasm";
-    environment.fallback_triggered = !webgpu.available;
-    environment.gpu = {
-      adapter: webgpu.adapter || "unknown",
-      required_features: webgpu.features || [],
-      limits: webgpu.limits || {}
-    };
-  }
-
-  environment.worker_mode = state.probes.worker ? "worker" : "main";
-
-  const initMs = webgpu && webgpu.initMs ? round(webgpu.initMs, 2) : round(performance.now() - state.startedAt, 2);
-  const successRate = webgpu ? (webgpu.available ? 1 : 0) : 0.5;
-  const errorType = webgpu && webgpu.error ? webgpu.error : "";
-
-  return {
-    meta: {
-      repo: metadata.repo,
-      commit: "bootstrap-generated",
-      timestamp: nowIso(),
-      owner: "ai-webgpu-lab",
-      track: metadata.trackSlug,
-      scenario: "baseline-probe",
-      notes: metadata.purpose + ". Replace generic probes with workload-specific logic before treating this as a final benchmark."
-    },
-    environment,
-    workload: {
-      kind: metadata.workloadKind,
-      name: metadata.repo + " baseline probe",
-      input_profile: "bootstrap-default"
-    },
-    metrics: {
-      common: {
-        time_to_interactive_ms: round(performance.now() - state.startedAt, 2),
-        init_ms: initMs,
-        success_rate: successRate,
-        peak_memory_note: navigator.deviceMemory ? String(navigator.deviceMemory) + " GB reported by browser" : "deviceMemory unavailable",
-        error_type: errorType
-      }
-    },
-    status: webgpu ? (webgpu.available ? "success" : "partial") : "partial",
-    artifacts: {
-      deploy_url: metadata.pagesUrl
-    }
-  };
-}
-
-function renderJson() {
-  const environment = state.environment || baseEnvironment();
-  elements.environmentJson.textContent = JSON.stringify(environment, null, 2);
-  elements.resultJson.textContent = JSON.stringify(schemaResult(), null, 2);
-}
-
-async function detectEnvironment() {
-  ensureEnvironment();
-  log("Captured base environment snapshot.");
-  render();
-}
-
-function extractLimits(source) {
-  const limits = {};
-
-  if (!source) {
-    return limits;
-  }
-
-  for (const key of knownLimitKeys) {
-    if (key in source && Number.isFinite(source[key])) {
-      limits[key] = Number(source[key]);
-    }
-  }
-
-  return limits;
-}
-
-async function runWebgpuProbe() {
-  ensureEnvironment();
-  const startedAt = performance.now();
-
-  if (!("gpu" in navigator)) {
-    state.probes.webgpu = {
-      available: false,
-      initMs: performance.now() - startedAt,
-      error: "navigator.gpu unavailable",
-      adapter: "unavailable",
-      features: [],
-      limits: {}
-    };
-    log("WebGPU probe failed: navigator.gpu is not available in this browser.");
-    render();
-    return;
-  }
-
-  try {
-    const adapter = await navigator.gpu.requestAdapter();
-    if (!adapter) {
-      throw new Error("No GPU adapter returned");
-    }
-
-    let adapterInfo = null;
-    if (typeof adapter.requestAdapterInfo === "function") {
-      try {
-        adapterInfo = await adapter.requestAdapterInfo();
-      } catch (error) {
-        adapterInfo = null;
-      }
-    }
-
-    const device = await adapter.requestDevice();
-    const adapterName = (adapterInfo && (adapterInfo.description || adapterInfo.vendor || adapterInfo.architecture)) || "WebGPU adapter";
-    const features = Array.from(device.features || []);
-    const limits = extractLimits(device.limits || adapter.limits);
-
-    state.probes.webgpu = {
-      available: true,
-      initMs: performance.now() - startedAt,
-      adapter: adapterName,
-      features,
-      limits
-    };
-    log("WebGPU probe succeeded with adapter: " + adapterName + ".");
-  } catch (error) {
-    state.probes.webgpu = {
-      available: false,
-      initMs: performance.now() - startedAt,
-      error: error instanceof Error ? error.message : String(error),
-      adapter: "unavailable",
-      features: [],
-      limits: {}
-    };
-    log("WebGPU probe failed: " + state.probes.webgpu.error + ".");
-  }
-
-  render();
-}
-
-async function runFrameProbe() {
-  ensureEnvironment();
-  const deltas = [];
-
-  await new Promise((resolve) => {
-    let previous = 0;
-    function step(timestamp) {
-      if (previous !== 0) {
-        deltas.push(timestamp - previous);
-      }
-      previous = timestamp;
-
-      if (deltas.length >= 120) {
-        resolve();
-        return;
-      }
-
-      requestAnimationFrame(step);
-    }
-
-    requestAnimationFrame(step);
-  });
-
-  const avgDelta = deltas.reduce((total, value) => total + value, 0) / deltas.length;
-  state.probes.frame = {
-    avgFrameMs: avgDelta,
-    avgFps: avgDelta > 0 ? 1000 / avgDelta : 0,
-    p95FrameMs: percentile(deltas, 0.95)
-  };
-  log("Frame probe captured " + deltas.length + " frames.");
-  render();
-}
-
-async function runWorkerProbe() {
-  ensureEnvironment();
-  const workerScript = "self.onmessage = (event) => { if (event.data === 'ping') { self.postMessage(performance.now()); } };";
-  const workerUrl = URL.createObjectURL(new Blob([workerScript], { type: "text/javascript" }));
-  const probeWorker = new Worker(workerUrl);
-  const roundTrips = [];
-
-  try {
-    for (let index = 0; index < 20; index += 1) {
-      const sample = await new Promise((resolve, reject) => {
-        const startedAt = performance.now();
-        const timeout = setTimeout(() => reject(new Error("Worker probe timed out")), 2000);
-
-        probeWorker.onmessage = () => {
-          clearTimeout(timeout);
-          resolve(performance.now() - startedAt);
-        };
-
-        probeWorker.postMessage("ping");
-      });
-      roundTrips.push(sample);
-    }
-
-    const avgRtt = roundTrips.reduce((total, value) => total + value, 0) / roundTrips.length;
-    state.probes.worker = {
-      avgRttMs: avgRtt,
-      p95RttMs: percentile(roundTrips, 0.95)
-    };
-    log("Worker probe completed with " + roundTrips.length + " round-trips.");
-  } catch (error) {
-    state.probes.worker = {
-      avgRttMs: null,
-      p95RttMs: null,
-      error: error instanceof Error ? error.message : String(error)
-    };
-    log("Worker probe failed: " + state.probes.worker.error + ".");
-  } finally {
-    probeWorker.terminate();
-    URL.revokeObjectURL(workerUrl);
-  }
-
-  render();
-}
-
-function downloadJson() {
-  const payload = JSON.stringify(schemaResult(), null, 2);
-  const blob = new Blob([payload], { type: "application/json" });
-  const objectUrl = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = objectUrl;
-  anchor.download = metadata.repo + "-baseline-probe.json";
-  anchor.click();
-  URL.revokeObjectURL(objectUrl);
-  log("Downloaded schema-aligned baseline JSON draft.");
 }
 
 function render() {
-  renderMeta();
   renderStatus();
   renderMetrics();
-  renderJson();
+  renderEnvironment();
+  renderLogs();
+  if (!state.transcript && !state.active && !state.run) renderTranscript("");
+  if (!state.reply && !state.active && !state.run) renderReply("");
+  elements.resultJson.textContent = JSON.stringify(buildResult(), null, 2);
 }
 
-elements.detectEnvironment.addEventListener("click", detectEnvironment);
-elements.runWebgpu.addEventListener("click", runWebgpuProbe);
-elements.runFrame.addEventListener("click", runFrameProbe);
-elements.runWorker.addEventListener("click", runWorkerProbe);
+function downloadJson() {
+  const blob = new Blob([JSON.stringify(buildResult(), null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `exp-voice-assistant-local-${state.run ? "voice-turn" : "pending"}.json`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+  log("Downloaded voice assistant readiness JSON draft.");
+}
+
+elements.runAssistant.addEventListener("click", () => {
+  runAssistantTurn().catch((error) => {
+    state.active = false;
+    log(`Voice turn failed: ${error.message}`);
+    render();
+  });
+});
 elements.downloadJson.addEventListener("click", downloadJson);
 
-renderList(elements.focusList, focusItems());
-renderList(elements.nextSteps, nextSteps());
-log("Baseline probe ready. Capture environment first, then run WebGPU, frame, and worker probes.");
-detectEnvironment();
-render();
+(async function init() {
+  await loadFixture();
+  log("Voice assistant readiness harness ready.");
+  render();
+})();

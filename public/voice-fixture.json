@@ -1,0 +1,38 @@
+{
+  "audioSeconds": 6.8,
+  "wakeWord": "aurora",
+  "reference": "aurora summarize local webgpu lab status and mention fallback notes",
+  "segments": [
+    {
+      "text": "aurora summarize local webgpu lab status",
+      "processingMs": 34
+    },
+    {
+      "text": "and mention fallback notes",
+      "processingMs": 40
+    }
+  ],
+  "intent": {
+    "id": "lab_status_brief",
+    "processingMs": 16
+  },
+  "reply": {
+    "text": "Local WebGPU baselines are ready. Dedicated harness coverage now tracks graphics, blackhole, and voice workloads with fallback metadata attached.",
+    "processingMs": 20
+  },
+  "ttsVoice": "alloy-local",
+  "ttsChunks": [
+    {
+      "text": "Local WebGPU baselines are ready.",
+      "synthesisMs": 18
+    },
+    {
+      "text": "Dedicated harness coverage now tracks graphics, blackhole, and voice workloads.",
+      "synthesisMs": 22
+    },
+    {
+      "text": "Fallback metadata stays attached to every captured run.",
+      "synthesisMs": 18
+    }
+  ]
+}
