@@ -1,0 +1,101 @@
+{
+  "meta": {
+    "repo": "exp-voice-assistant-local",
+    "commit": "e4f02bd",
+    "timestamp": "2026-05-20T15:46:41.409Z",
+    "owner": "ai-webgpu-lab",
+    "track": "audio",
+    "scenario": "voice-assistant-local-readiness",
+    "notes": "wakeWord=aurora; segments=2; intent=lab_status_brief; ttsVoice=alloy-local; firstAudioMs=196.5; roundtripMs=269.6; backend=webgpu; fallback=false; realAdapter=fallback(adapter.loadModel is not a function); automation=playwright-chromium",
+    "capture_context": {
+      "tool": "playwright-chromium",
+      "browser_name": "Chromium",
+      "browser_version": "147.0.7727.15",
+      "headless": true,
+      "captured_at": "2026-05-20T15:46:41.587Z",
+      "captured_by": "codex"
+    },
+    "capture_scenario_id": "10-voice-assistant-local-real-voice-assistant",
+    "capture_url_search": "?mode=real-voice-assistant"
+  },
+  "environment": {
+    "browser": {
+      "name": "Chrome",
+      "version": "147.0.7727.15"
+    },
+    "os": {
+      "name": "Linux",
+      "version": "unknown"
+    },
+    "device": {
+      "name": "Linux x86_64",
+      "class": "desktop-high",
+      "cpu": "16 threads",
+      "memory_gb": 32,
+      "power_mode": "unknown"
+    },
+    "gpu": {
+      "adapter": "navigator.gpu available",
+      "required_features": [
+        "shader-f16"
+      ],
+      "limits": {
+        "maxBindGroups": 4
+      }
+    },
+    "backend": "webgpu",
+    "fallback_triggered": false,
+    "worker_mode": "worker",
+    "cache_state": "warm"
+  },
+  "workload": {
+    "kind": "voice-assistant",
+    "name": "voice-assistant-local-readiness",
+    "input_profile": "6.8s-2-segments",
+    "model_id": "deterministic-voice-assistant-local-v1",
+    "dataset": "voice-fixture-v1"
+  },
+  "metrics": {
+    "common": {
+      "time_to_interactive_ms": 1271.2,
+      "init_ms": 269.6,
+      "success_rate": 1,
+      "peak_memory_note": "32 GB reported by browser",
+      "error_type": ""
+    },
+    "stt": {
+      "audio_sec_per_sec": 89.47,
+      "first_partial_ms": 34.1,
+      "final_latency_ms": 76,
+      "roundtrip_ms": 269.6,
+      "wer": 0,
+      "cer": 0
+    }
+  },
+  "status": "success",
+  "artifacts": {
+    "raw_logs": [
+      "./reports/logs/10-voice-assistant-local-real-voice-assistant.log"
+    ],
+    "deploy_url": "https://ai-webgpu-lab.github.io/exp-voice-assistant-local/",
+    "runtime_adapter": {
+      "id": "voice-assistant-xenova-whisper-tiny-xenova-phi-3-mini-4k-instruct-q4f16-300",
+      "label": "Voice Assistant (Transformers.js 3.0.0)",
+      "status": "connected",
+      "isReal": true,
+      "version": "3.0.0",
+      "capabilities": [
+        "prefill",
+        "decode",
+        "asr",
+        "reply",
+        "fixed-output-budget"
+      ],
+      "loadType": "async",
+      "message": "Real runtime adapter 'voice-assistant-xenova-whisper-tiny-xenova-phi-3-mini-4k-instruct-q4f16-300' is connected."
+    },
+    "screenshots": [
+      "./reports/screenshots/10-voice-assistant-local-real-voice-assistant.png"
+    ]
+  }
+}
